@@ -16,7 +16,6 @@ const {
   CONTACT_METHODS,
 } = require('./menus');
 const { generateSessionId, hashSessionId, obfuscatePhone } = require('./session');
-const { registerAdvantaRoute } = require('./advanta');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -27,6 +26,9 @@ const supabase = createClient(
 );
 
 // ---- 1-minute inactivity timeout ----
+// Africa's Talking controls the real session length, but we track our own
+// "last seen" time per sessionId and force-end if more than 60s has passed
+// since the previous request for that session.
 const SESSION_TIMEOUT_MS = 60 * 1000;
 const lastSeen = new Map();
 
@@ -40,6 +42,7 @@ function touch(sessionId) {
   lastSeen.set(sessionId, Date.now());
 }
 
+// Clean up old sessions every 5 minutes so the map doesn't grow forever
 setInterval(() => {
   const now = Date.now();
   for (const [id, time] of lastSeen.entries()) {
@@ -47,23 +50,29 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
-// In-memory cache of fetched opportunities per session
+// In-memory cache of fetched opportunities per session, so when a user
+// picks "2" we know which opportunity that refers to without re-querying
+// in a fragile way. Cleared on session end/expiry.
 const opportunityCache = new Map();
 
-// ---- Shared USSD logic, used by BOTH Africa's Talking and Advanta routes ----
-async function handleUssdLogic({ sessionId, phoneNumber, text }) {
+app.post('/ussd', async (req, res) => {
+  const { sessionId, serviceCode, phoneNumber, text } = req.body;
   const input = (text || '').trim();
   const parts = input.split('*');
   let response = '';
 
+  res.set('Content-Type', 'text/plain');
+
+  // ---- Timeout check ----
   if (isExpired(sessionId)) {
     opportunityCache.delete(sessionId);
     lastSeen.delete(sessionId);
-    return `END Session timed out due to inactivity. Please dial again.`;
+    return res.send(`END Session timed out due to inactivity. Please dial again.`);
   }
   touch(sessionId);
 
   try {
+    // Main menu
     if (input === '') {
       response = mainMenu();
 
@@ -107,10 +116,11 @@ async function handleUssdLogic({ sessionId, phoneNumber, text }) {
       }]);
       response = `END Report submitted. Thank you for speaking up.\nYour session ID: ${sid}`;
 
-    // ===== 3. Find a Mentor =====
+    // ===== 3. Find a Mentor (matches website flow) =====
     } else if (input === '3') {
       response = mentorNeedMenu();
 
+    // Step: need selected -> ask contact method
     } else if (parts[0] === '3' && parts.length === 2) {
       const needIdx = parseInt(parts[1], 10) - 1;
       if (!NEED_OPTIONS[needIdx]) {
@@ -119,20 +129,24 @@ async function handleUssdLogic({ sessionId, phoneNumber, text }) {
         response = mentorContactMenu();
       }
 
+    // Step: contact method selected
     } else if (parts[0] === '3' && parts.length === 3) {
       const methodIdx = parseInt(parts[2], 10) - 1;
       const method = CONTACT_METHODS[methodIdx];
       if (!method) {
         response = `END Invalid selection.`;
       } else if (method.key === 'check') {
+        // No phone needed — submit immediately
         response = await submitMentorRequest({ parts, phone: null, consent: false });
       } else {
         response = mentorPhonePrompt();
       }
 
+    // Step: phone entered -> ask consent
     } else if (parts[0] === '3' && parts.length === 4) {
       response = mentorConsentPrompt();
 
+    // Step: consent answered -> submit
     } else if (parts[0] === '3' && parts.length === 5) {
       const consentChoice = parts[4];
       if (consentChoice === '1') {
@@ -150,6 +164,7 @@ async function handleUssdLogic({ sessionId, phoneNumber, text }) {
       const code = parts[1];
       const hash = hashSessionId(code);
 
+      // Check both reports and mentorship_requests since either can produce a session ID
       const { data: report } = await supabase
         .from('reports').select('status').eq('session_id_hash', hash).maybeSingle();
       const { data: mentor } = await supabase
@@ -163,6 +178,7 @@ async function handleUssdLogic({ sessionId, phoneNumber, text }) {
         response = `END Session not found. Check your ID and try again.`;
       }
 
+    // Exit
     } else if (input === '0') {
       response = `END Thank you for using FURSAD. Goodbye!`;
 
@@ -174,15 +190,16 @@ async function handleUssdLogic({ sessionId, phoneNumber, text }) {
     response = `END Something went wrong. Please try again later.`;
   }
 
+  // Clean up cache once session ends
   if (response.startsWith('END')) {
     opportunityCache.delete(sessionId);
     lastSeen.delete(sessionId);
   }
 
-  return response;
-}
+  res.send(response);
+});
 
-// Helper: builds and inserts a mentorship_request
+// Helper: builds and inserts a mentorship_request, matching website fields
 async function submitMentorRequest({ parts, phone, consent }) {
   const needIdx = parseInt(parts[1], 10) - 1;
   const methodIdx = parseInt(parts[2], 10) - 1;
@@ -203,17 +220,6 @@ async function submitMentorRequest({ parts, phone, consent }) {
 
   return mentorConfirmation(sid);
 }
-
-// ---- Africa's Talking route (POST) ----
-app.post('/ussd', async (req, res) => {
-  const { sessionId, phoneNumber, text } = req.body;
-  res.set('Content-Type', 'text/plain');
-  const response = await handleUssdLogic({ sessionId, phoneNumber, text });
-  res.send(response);
-});
-
-// ---- Advanta route (GET) ----
-registerAdvantaRoute(app, { handleUssdLogic });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
